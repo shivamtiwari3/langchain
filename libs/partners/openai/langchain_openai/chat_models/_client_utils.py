@@ -4,19 +4,6 @@ This module allows for the caching of httpx clients to avoid creating new instan
 for each instance of ChatOpenAI.
 
 Logic is largely replicated from openai._base_client.
-
-Async client caching strategy
-------------------------------
-``httpx.AsyncClient`` instances are bound to the event loop that first issues a
-request through them.  A process-global ``@lru_cache`` (the previous approach) shares
-one client across all event loops, which causes ``httpcore.ConnectError`` /
-``RuntimeError: Event loop is closed`` when a second call is made from a *different*
-loop (e.g. two successive ``asyncio.run()`` calls in separate threads).
-
-To fix this, async clients are cached in a ``weakref.WeakKeyDictionary`` keyed by the
-*current* event loop.  The ``WeakKeyDictionary`` automatically removes the entry when
-the loop is garbage-collected, so there is no unbounded memory growth.  Sync clients
-are unaffected and continue to use a process-global ``@lru_cache``.
 """
 
 from __future__ import annotations
@@ -30,6 +17,7 @@ from functools import lru_cache
 from threading import Lock
 from typing import Any, cast
 
+import httpx
 import openai
 from pydantic import SecretStr
 
@@ -90,53 +78,71 @@ def _cached_sync_httpx_client(
     return _build_sync_httpx_client(base_url, timeout)
 
 
-# Per-loop async client cache: {loop -> {(base_url, timeout) -> client}}.
-# WeakKeyDictionary ensures entries are removed when the loop is garbage-collected.
-_async_client_cache: weakref.WeakKeyDictionary[
-    asyncio.AbstractEventLoop,
-    dict[tuple[str | None, Any], _AsyncHttpxClientWrapper],
-] = weakref.WeakKeyDictionary()
-_async_client_cache_lock = Lock()
-
-
+@lru_cache
 def _cached_async_httpx_client(
     base_url: str | None, timeout: Any
 ) -> _AsyncHttpxClientWrapper:
-    """Return a cached async httpx client scoped to the current event loop.
+    return _build_async_httpx_client(base_url, timeout)
 
-    Using a process-global ``@lru_cache`` (the previous implementation) shares a
-    single ``httpx.AsyncClient`` across all event loops.  When a second event loop
-    runs after the first has been closed (e.g. two ``asyncio.run()`` calls in
-    different threads), the cached client is bound to the dead loop and raises
-    ``APIConnectionError``.
 
-    This implementation caches one client *per event loop* so each loop always
-    gets a fresh, compatible client.  The ``WeakKeyDictionary`` guarantees that
-    cache entries are cleaned up automatically when a loop is garbage-collected.
+class _LoopAwareAsyncHttpxClientWrapper(openai.DefaultAsyncHttpxClient):
+    """Proxy that dispatches async requests to a per-event-loop inner httpx client.
 
-    Args:
-        base_url: Optional base URL override for the OpenAI API.
-        timeout: Timeout configuration forwarded to ``httpx.AsyncClient``.
+    The outer proxy is cached via `@lru_cache` (one instance per `(base_url, timeout)`
+    pair), preserving `ChatOpenAI` instantiation performance.
 
-    Returns:
-        An ``_AsyncHttpxClientWrapper`` bound to the current event loop.
+    Each event loop gets its own inner `_AsyncHttpxClientWrapper`. This prevents
+    `APIConnectionError` caused by reusing `asyncio.Lock`-bound connection pools
+    across different event loops — the bug that occurs when `@lru_cache` returns a
+    single shared `httpx.AsyncClient` for all loops.
+
+    When an event loop is garbage-collected, `WeakKeyDictionary` automatically
+    removes the corresponding inner client entry.
     """
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        # No running event loop — called during synchronous initialization.
-        # Return a fresh (uncached) client; it will bind to whichever loop
-        # first issues a request through it.
-        return _build_async_httpx_client(base_url, timeout)
 
-    cache_key = (base_url, timeout)
-    with _async_client_cache_lock:
-        if loop not in _async_client_cache:
-            _async_client_cache[loop] = {}
-        loop_clients = _async_client_cache[loop]
-        if cache_key not in loop_clients:
-            loop_clients[cache_key] = _build_async_httpx_client(base_url, timeout)
-        return loop_clients[cache_key]
+    def __init__(self, base_url: str | None, timeout: Any) -> None:
+        effective_url = (
+            base_url or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1"
+        )
+        super().__init__(base_url=effective_url, timeout=timeout)
+        self._lc_base_url = base_url
+        self._lc_timeout = timeout
+        self._loop_clients: weakref.WeakKeyDictionary[
+            asyncio.AbstractEventLoop, _AsyncHttpxClientWrapper
+        ] = weakref.WeakKeyDictionary()
+        self._lock = Lock()
+
+    def _get_client_for_current_loop(self) -> _AsyncHttpxClientWrapper:
+        """Get or create an inner httpx client bound to the current event loop."""
+        loop = asyncio.get_running_loop()
+        with self._lock:
+            if loop not in self._loop_clients:
+                self._loop_clients[loop] = _build_async_httpx_client(
+                    self._lc_base_url, self._lc_timeout
+                )
+        return self._loop_clients[loop]
+
+    async def send(self, request: httpx.Request, **kwargs: Any) -> httpx.Response:
+        """Send request via the inner client bound to the current event loop."""
+        return await self._get_client_for_current_loop().send(request, **kwargs)
+
+    async def aclose(self) -> None:
+        """Close the inner client for the current event loop."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        with self._lock:
+            client = self._loop_clients.pop(loop, None)
+        if client is not None:
+            await client.aclose()
+
+
+@lru_cache
+def _get_loop_aware_async_httpx_client(
+    base_url: str | None, timeout: Any
+) -> _LoopAwareAsyncHttpxClientWrapper:
+    return _LoopAwareAsyncHttpxClientWrapper(base_url, timeout)
 
 
 def _get_default_httpx_client(
@@ -156,17 +162,24 @@ def _get_default_httpx_client(
 
 def _get_default_async_httpx_client(
     base_url: str | None, timeout: Any
-) -> _AsyncHttpxClientWrapper:
-    """Get default httpx client.
+) -> _LoopAwareAsyncHttpxClientWrapper | _AsyncHttpxClientWrapper:
+    """Get default async httpx client.
 
-    Uses cached client unless timeout is `httpx.Timeout`, which is not hashable.
+    Returns a `_LoopAwareAsyncHttpxClientWrapper` proxy when the timeout is
+    hashable (cached path). The proxy is shared across all `ChatOpenAI` instances
+    with the same `(base_url, timeout)` but internally routes each request to an
+    inner `httpx.AsyncClient` bound to the calling event loop, preventing
+    `APIConnectionError` from cross-loop connection-pool reuse.
+
+    Falls back to a plain `_AsyncHttpxClientWrapper` when timeout is not hashable
+    (e.g., an `httpx.Timeout` object), since `@lru_cache` requires hashable keys.
     """
     try:
         hash(timeout)
     except TypeError:
         return _build_async_httpx_client(base_url, timeout)
     else:
-        return _cached_async_httpx_client(base_url, timeout)
+        return _get_loop_aware_async_httpx_client(base_url, timeout)
 
 
 def _resolve_sync_and_async_api_keys(
